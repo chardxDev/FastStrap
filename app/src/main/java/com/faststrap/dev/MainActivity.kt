@@ -12,7 +12,13 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
+import org.json.JSONException
+import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import rikka.shizuku.Shizuku
 
 class Palette(
@@ -28,10 +34,18 @@ private fun pal(bg: String, c1: String, c2: String, c3: String, accent: String, 
 
 class MainActivity : AppCompatActivity() {
 
+    /** One UI toggle plus the FFlags it controls. Add a new tweak by adding one entry in onCreate. */
+    private class Tweak(
+        val prefKey: String,
+        val toggle: CompoundButton,
+        val flags: Map<String, Any>
+    )
+
     private val flagsPath = "/data/local/tmp/ClientAppSettings.json"
     private val backupPath = "/data/local/tmp/faststrap_refresh_backup"
     private val fpsProp = "debug.graphics.game_default_frame_rate.disabled"
     private val robloxPkg = "com.roblox.client"
+    private val shellTimeoutSeconds = 20L
 
     private val palettes = listOf(
         pal("#FFFFFF", "#ECEFFE", "#E5F1F8", "#FBE9EE", "#111111", "#AAB6F5", "#B9C1F2"),
@@ -67,7 +81,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cbShadows: CompoundButton
     private lateinit var cbTextures: CompoundButton
     private lateinit var switches: List<CompoundButton>
+    private lateinit var tweaks: List<Tweak>
     private val segments = mutableListOf<MaterialCardView>()
+
+    // Commands run one at a time off the main thread; the watchdog kills hung processes.
+    private val executor = Executors.newSingleThreadExecutor()
+    private val watchdog = Executors.newSingleThreadScheduledExecutor()
+    private var busy = false
 
     private val permissionListener =
         Shizuku.OnRequestPermissionResultListener { _, _ -> updateStatus() }
@@ -102,16 +122,36 @@ class MainActivity : AppCompatActivity() {
         cbGrass = findViewById(R.id.cbGrass)
         cbShadows = findViewById(R.id.cbShadows)
         cbTextures = findViewById(R.id.cbTextures)
-        switches = listOf(cbFps, cbFpsCounter, cbSky, cbGrass, cbShadows, cbTextures)
+
+        tweaks = listOf(
+            Tweak(
+                "fps", cbFps, linkedMapOf<String, Any>(
+                    "DFIntTaskSchedulerTargetFps" to 9999,
+                    "FFlagEnableAndroidVsync" to false,
+                    "FFlagTaskSchedulerLimitTargetFpsTo2402" to false
+                )
+            ),
+            Tweak("fpscounter", cbFpsCounter, linkedMapOf<String, Any>("FFlagDebugDisplayFPS" to true)),
+            Tweak("sky", cbSky, linkedMapOf<String, Any>("FFlagDebugSkyGray" to true)),
+            Tweak(
+                "grass", cbGrass, linkedMapOf<String, Any>(
+                    "FIntFRMMinGrassDistance" to 0,
+                    "FIntFRMMaxGrassDistance" to 0
+                )
+            ),
+            Tweak("shadows", cbShadows, linkedMapOf<String, Any>("DFFlagDebugPauseVoxelizer" to true)),
+            Tweak(
+                "textures", cbTextures, linkedMapOf<String, Any>(
+                    "DFFlagTextureQualityOverrideEnabled" to true,
+                    "DFIntTextureQualityOverride" to 0
+                )
+            )
+        )
+        switches = tweaks.map { it.toggle }
 
         buildSegments()
 
-        cbFps.isChecked = prefs.getBoolean("fps", false)
-        cbFpsCounter.isChecked = prefs.getBoolean("fpscounter", false)
-        cbSky.isChecked = prefs.getBoolean("sky", false)
-        cbGrass.isChecked = prefs.getBoolean("grass", false)
-        cbShadows.isChecked = prefs.getBoolean("shadows", false)
-        cbTextures.isChecked = prefs.getBoolean("textures", false)
+        tweaks.forEach { it.toggle.isChecked = prefs.getBoolean(it.prefKey, false) }
         switches.forEach { it.setOnCheckedChangeListener { _, _ -> updateCount() } }
 
         Shizuku.addRequestPermissionResultListener(permissionListener)
@@ -119,9 +159,17 @@ class MainActivity : AppCompatActivity() {
         Shizuku.addBinderDeadListener(binderDead)
 
         requestButton.setOnClickListener { Shizuku.requestPermission(100) }
-        applyButton.setOnClickListener { applyFlags() }
+        applyButton.setOnClickListener {
+            confirmRestart("Apply the selected tweaks. Roblox needs a restart for them to take effect.") {
+                applyFlags(it)
+            }
+        }
         viewButton.setOnClickListener { viewFlags() }
-        removeButton.setOnClickListener { removeFlags() }
+        removeButton.setOnClickListener {
+            confirmRestart("Remove all FastStrap flags. Other flags in the file are kept.") {
+                removeFlags(it)
+            }
+        }
         refreshButton.setOnClickListener { updateStatus() }
 
         applyTheme()
@@ -162,6 +210,7 @@ class MainActivity : AppCompatActivity() {
             s.setCardBackgroundColor(p.seg)
             s.strokeWidth = if (i == themeIndex) (3 * d).toInt() else 0
             s.setStrokeColor(palettes[themeIndex].accent)
+            s.contentDescription = "Theme ${i + 1}" + if (i == themeIndex) ", selected" else ""
             s.setOnClickListener {
                 themeIndex = i
                 prefs.edit().putInt("theme", i).apply()
@@ -207,6 +256,14 @@ class MainActivity : AppCompatActivity() {
         Shizuku.pingBinder() &&
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
 
+    private fun robloxInstalled(): Boolean =
+        try {
+            packageManager.getPackageInfo(robloxPkg, 0)
+            true
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        }
+
     private fun updateStatus() = runOnUiThread {
         val alive = Shizuku.pingBinder()
         val ready = hasShizuku()
@@ -218,16 +275,22 @@ class MainActivity : AppCompatActivity() {
         hintText.text = when {
             !alive -> "Open the Shizuku app and tap Start."
             !ready -> "Allow FastStrap to use Shizuku."
+            !robloxInstalled() -> "Roblox ($robloxPkg) isn't installed."
             else -> ""
         }
-        hintText.visibility = if (ready) View.GONE else View.VISIBLE
+        hintText.visibility = if (hintText.text.isEmpty()) View.GONE else View.VISIBLE
         requestButton.visibility = if (alive && !ready) View.VISIBLE else View.GONE
+        val enabled = ready && !busy
         listOf(applyButton, viewButton, removeButton).forEach {
-            it.isEnabled = ready
-            it.alpha = if (ready) 1f else 0.4f
+            it.isEnabled = enabled
+            it.alpha = if (enabled) 1f else 0.4f
         }
     }
 
+    /**
+     * Runs a shell command through Shizuku. stderr is merged into stdout inside the shell so a
+     * full stderr buffer can't deadlock us, and a watchdog kills the process after a timeout.
+     */
     private fun runShell(cmd: String): String {
         val method = Shizuku::class.java.getDeclaredMethod(
             "newProcess",
@@ -237,28 +300,57 @@ class MainActivity : AppCompatActivity() {
         )
         method.isAccessible = true
         val process = method.invoke(
-            null, arrayOf("sh", "-c", cmd), null, null
+            null, arrayOf("sh", "-c", "{ $cmd\n} 2>&1"), null, null
         ) as Process
-        val out = process.inputStream.bufferedReader().readText()
-        val err = process.errorStream.bufferedReader().readText()
-        process.waitFor()
-        return out + err
+        val timedOut = AtomicBoolean(false)
+        val killer = watchdog.schedule({
+            timedOut.set(true)
+            process.destroy()
+        }, shellTimeoutSeconds, TimeUnit.SECONDS)
+        try {
+            val out = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            return if (timedOut.get()) out + "\n(timed out after ${shellTimeoutSeconds}s)" else out
+        } finally {
+            killer.cancel(false)
+            process.destroy()
+        }
     }
 
-    private fun runAndShow(cmd: String) {
+    /** Runs [task] off the main thread, disables the buttons meanwhile, then shows its result. */
+    private fun runTask(task: () -> String) {
+        if (busy) return
+        busy = true
         outputText.text = "Running..."
-        Thread {
+        updateStatus()
+        executor.execute {
             val result = try {
-                runShell(cmd)
+                task()
             } catch (e: Exception) {
-                "Error: " + e.toString()
+                "Error: $e"
             }
-            runOnUiThread { outputText.text = result }
-        }.start()
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                busy = false
+                outputText.text = result
+                updateStatus()
+            }
+        }
+    }
+
+    private fun confirmRestart(message: String, action: (restart: Boolean) -> Unit) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Restart Roblox?")
+            .setMessage(message)
+            .setPositiveButton("Continue & restart") { _, _ -> action(true) }
+            .setNeutralButton("Continue, no restart") { _, _ -> action(false) }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun fpsOnScript(): String = "setprop $fpsProp true\n"
 
+    // The restore block cleans up refresh-rate backups that may have been written by older builds.
     private fun fpsOffScript(): String =
         "if [ -e $backupPath ]; then\n" +
             "set -- \$(cat $backupPath)\n" +
@@ -270,83 +362,82 @@ class MainActivity : AppCompatActivity() {
             "fi\n" +
             "setprop $fpsProp false\n"
 
-    private fun buildJson(): String {
-        val flags = mutableListOf<String>()
-        if (cbFps.isChecked) {
-            flags.add("\"DFIntTaskSchedulerTargetFps\": 9999")
-            flags.add("\"FFlagEnableAndroidVsync\": false")
-            flags.add("\"FFlagTaskSchedulerLimitTargetFpsTo2402\": false")
+    private fun managedKeys(): Set<String> = tweaks.flatMap { it.flags.keys }.toSet()
+
+    /**
+     * Merges our flags into whatever is already in the flags file: our keys are replaced,
+     * everything else is preserved. Returns null when nothing is left (file should be deleted).
+     */
+    private fun mergeJson(existing: String, selected: List<Tweak>): String? {
+        val obj = try {
+            if (existing.isBlank()) JSONObject() else JSONObject(existing)
+        } catch (e: JSONException) {
+            JSONObject()
         }
-        if (cbFpsCounter.isChecked) {
-            flags.add("\"FFlagDebugDisplayFPS\": true")
-        }
-        if (cbSky.isChecked) {
-            flags.add("\"FFlagDebugSkyGray\": true")
-        }
-        if (cbGrass.isChecked) {
-            flags.add("\"FIntFRMMinGrassDistance\": 0")
-            flags.add("\"FIntFRMMaxGrassDistance\": 0")
-        }
-        if (cbShadows.isChecked) {
-            flags.add("\"DFFlagDebugPauseVoxelizer\": true")
-        }
-        if (cbTextures.isChecked) {
-            flags.add("\"DFFlagTextureQualityOverrideEnabled\": true")
-            flags.add("\"DFIntTextureQualityOverride\": 0")
-        }
-        return if (flags.isEmpty()) "{}"
-        else "{\n  " + flags.joinToString(",\n  ") + "\n}"
+        managedKeys().forEach { obj.remove(it) }
+        selected.forEach { t -> t.flags.forEach { (k, v) -> obj.put(k, v) } }
+        return if (obj.length() == 0) null else obj.toString(2)
     }
 
-    private fun applyFlags() {
-        prefs.edit()
-            .putBoolean("fps", cbFps.isChecked)
-            .putBoolean("fpscounter", cbFpsCounter.isChecked)
-            .putBoolean("sky", cbSky.isChecked)
-            .putBoolean("grass", cbGrass.isChecked)
-            .putBoolean("shadows", cbShadows.isChecked)
-            .putBoolean("textures", cbTextures.isChecked)
-            .apply()
-
-        val json = buildJson()
-        val sb = StringBuilder()
-        if (json == "{}") {
-            sb.append("rm -f $flagsPath\n")
+    private fun writeFlagsScript(json: String?): String =
+        if (json == null) {
+            "rm -f $flagsPath\n"
         } else {
-            sb.append("cat > $flagsPath.new <<'FASTSTRAP_END'\n")
-            sb.append(json).append("\n")
-            sb.append("FASTSTRAP_END\n")
-            sb.append("mv -f $flagsPath.new $flagsPath && chmod 0644 $flagsPath\n")
+            "cat > $flagsPath.new <<'FASTSTRAP_END'\n$json\nFASTSTRAP_END\n" +
+                "mv -f $flagsPath.new $flagsPath && chmod 0644 $flagsPath\n"
         }
-        sb.append(if (cbFps.isChecked) fpsOnScript() else fpsOffScript())
-        sb.append("am force-stop $robloxPkg\n")
-        sb.append("echo Applied. Roblox was restarted.\n")
-        sb.append("echo; ls -la $flagsPath 2>&1\n")
-        sb.append("echo; cat $flagsPath 2>&1\n")
-        sb.append("echo; echo fps_prop=\$(getprop $fpsProp)\n")
-        runAndShow(sb.toString())
+
+    private fun applyFlags(restart: Boolean) {
+        val editor = prefs.edit()
+        tweaks.forEach { editor.putBoolean(it.prefKey, it.toggle.isChecked) }
+        editor.apply()
+
+        // Snapshot UI state here; the task runs on a worker thread.
+        val selected = tweaks.filter { it.toggle.isChecked }
+        val fpsOn = cbFps.isChecked
+
+        runTask {
+            val json = mergeJson(runShell("cat $flagsPath 2>/dev/null"), selected)
+            val sb = StringBuilder()
+            sb.append(writeFlagsScript(json))
+            sb.append(if (fpsOn) fpsOnScript() else fpsOffScript())
+            if (restart) sb.append("am force-stop $robloxPkg\n")
+            sb.append("echo 'Applied ${selected.size} tweak(s). " +
+                if (restart) "Roblox was restarted.'\n" else "Restart Roblox to use them.'\n")
+            sb.append("echo; ls -la $flagsPath 2>&1\n")
+            sb.append("echo; cat $flagsPath 2>&1\n")
+            sb.append("echo; echo fps_prop=\$(getprop $fpsProp)\n")
+            runShell(sb.toString())
+        }
     }
 
     private fun viewFlags() {
-        runAndShow(
-            "echo '== flags file =='; " +
-                "if [ -f $flagsPath ]; then cat $flagsPath; else echo '(no flags file)'; fi; " +
-                "echo; echo '== fps =='; echo fps_prop=\$(getprop $fpsProp); " +
-                "echo peak=\$(settings get system peak_refresh_rate) " +
-                "min=\$(settings get system min_refresh_rate)"
-        )
+        runTask {
+            runShell(
+                "echo '== flags file =='; " +
+                    "if [ -f $flagsPath ]; then cat $flagsPath; else echo '(no flags file)'; fi; " +
+                    "echo; echo '== fps =='; echo fps_prop=\$(getprop $fpsProp); " +
+                    "echo peak=\$(settings get system peak_refresh_rate) " +
+                    "min=\$(settings get system min_refresh_rate)"
+            )
+        }
     }
 
-    private fun removeFlags() {
+    private fun removeFlags(restart: Boolean) {
         switches.forEach { it.isChecked = false }
         val keepTheme = themeIndex
         prefs.edit().clear().putInt("theme", keepTheme).apply()
-        runAndShow(
-            "rm -f $flagsPath\n" +
-                fpsOffScript() +
-                "am force-stop $robloxPkg\n" +
-                "echo 'All flags removed. Roblox was restarted.'"
-        )
+        runTask {
+            // Only our keys are removed; flags the user added by hand stay.
+            val json = mergeJson(runShell("cat $flagsPath 2>/dev/null"), emptyList())
+            val sb = StringBuilder()
+            sb.append(writeFlagsScript(json))
+            sb.append(fpsOffScript())
+            if (restart) sb.append("am force-stop $robloxPkg\n")
+            sb.append("echo 'FastStrap flags removed. " +
+                if (restart) "Roblox was restarted.'" else "Restart Roblox to finish.'")
+            runShell(sb.toString())
+        }
     }
 
     override fun onDestroy() {
@@ -354,5 +445,7 @@ class MainActivity : AppCompatActivity() {
         Shizuku.removeRequestPermissionResultListener(permissionListener)
         Shizuku.removeBinderReceivedListener(binderReceived)
         Shizuku.removeBinderDeadListener(binderDead)
+        executor.shutdownNow()
+        watchdog.shutdownNow()
     }
 }
