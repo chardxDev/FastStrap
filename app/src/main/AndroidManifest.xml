@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.faststrap.dev">
 
+    <!-- Lets the app check whether Roblox is installed (package visibility, Android 11+) -->
+    <queries>
+        <package android:name="com.roblox.client" />
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:supportsRtl="true"
